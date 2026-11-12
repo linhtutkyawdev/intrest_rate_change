@@ -7,6 +7,15 @@ import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
 import requests
 
+from rich.console import Console
+from rich.panel import Panel
+
+try:
+    from script_run.tui import InterestRateTUI
+except ImportError:
+    from tui import InterestRateTUI
+
+
 # =========================================================
 # STEP 1: CONFIGURATION
 # =========================================================
@@ -20,7 +29,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "db2f744b-6f4e-4b47-835e-03ec7e0c7f36"
+TOKEN = "b4bb08a5-940d-48dc-ac4e-d8ed7e543f4a"
 
 # Database configuration
 DB_CONFIG = {
@@ -56,14 +65,12 @@ DRY_RUN = False
 TEST_ONE_CLIENT = False
 
 # Batch settings
-BATCH_SIZE = 500
+BATCH_SIZE = 300
 BATCH_PAUSE_SECONDS = 1
 
 MAX_WORKERS = 15
 
 TODAY = date.today().strftime("%d %B %Y")
-
-# TODAY = "26 October 2026"
 
 REPORT_COLUMNS = [
     "officeId",
@@ -90,7 +97,6 @@ SAVE_INTERVAL = 100
 # =========================================================
 # STEP 2: REPORT FUNCTIONS
 # =========================================================
-db_pool = None
 
 def new_report_row(client_id, loan_id=None):
     return {
@@ -324,19 +330,7 @@ def process_account_command(savings_id, command, date_field):
         "dateFormat": "dd MMMM yyyy",
     }
 
-    print(f"Calling {command.upper()} for savingsId={savings_id}")
-
-    result = call_api("POST", url, payload)
-
-    if result["success"]:
-        print(
-            f"{command.upper()} succeeded "
-            f"(HTTP {result['http_status']})."
-        )
-    else:
-        print(f"{command.upper()} failed: {result['error']}")
-
-    return result
+    return call_api("POST", url, payload)
 
 
 # =========================================================
@@ -347,8 +341,6 @@ def create_cs_account(client_id, staff_id):
     payload = build_payload(client_id, staff_id)
 
     if DRY_RUN:
-        print(f"[Client {client_id}] DRY RUN: CREATE request body:")
-        print(json.dumps(payload, indent=2))
         return {
             "success": False,
             "dry_run": True,
@@ -357,7 +349,6 @@ def create_cs_account(client_id, staff_id):
             "error": "DRY_RUN: account was not created.",
         }
 
-    print(f"[Client {client_id}] Creating CS Savings Account...")
     return call_api("POST", API_BASE_URL, payload)
 
 
@@ -369,10 +360,6 @@ def approve_account(row):
     savings_id = row["savingsId"]
 
     if DRY_RUN:
-        print(
-            f"[Client {row['clientId']}] DRY RUN: "
-            f"would APPROVE savingsId={savings_id}"
-        )
         return False
 
     result = process_account_command(
@@ -405,10 +392,6 @@ def activate_account(row):
     savings_id = row["savingsId"]
 
     if DRY_RUN:
-        print(
-            f"[Client {row['clientId']}] DRY RUN: "
-            f"would ACTIVATE savingsId={savings_id}"
-        )
         return False
 
     result = process_account_command(
@@ -457,9 +440,6 @@ def process_client(pool, client_id, loan_id, existing_row):
     conn = None
     cursor = None
 
-    print("\n" + "=" * 65)
-    print(f"[Worker] Processing client_id={client_id}, loan_id={loan_id}")
-
     try:
         conn = pool.get_connection()
         cursor = conn.cursor()
@@ -480,28 +460,25 @@ def process_client(pool, client_id, loan_id, existing_row):
             """,
             (CS_PRODUCT_ID, int(client_id)),
         )
-        
+
         results = cursor.fetchall()
-        
+
         # Client does not exist or has no staff_id
         if not results or results[0][0] is None:
             row["processing_result"] = "FAILED_NO_STAFF_ID"
             row["create_status"] = "FAILED"
             row["create_error"] = "No staff_id found in m_client."
-            print(f"[Client {client_id}] No staff_id found. Skipping.")
             return row
-        
+
         staff_id = int(results[0][0])
-        
-        print(f"[Client {client_id}] staff_id={staff_id}")
-        
+
         # Extract matching savings accounts
         existing_accounts = [
             (result[1], result[2])
             for result in results
             if result[1] is not None
         ]
-        
+
         if len(existing_accounts) > 1:
             row["processing_result"] = "MULTIPLE_ACCOUNTS_REVIEW"
             row["create_status"] = "REVIEW_REQUIRED"
@@ -510,7 +487,6 @@ def process_client(pool, client_id, loan_id, existing_row):
                 f"and product ID {CS_PRODUCT_ID}. Manual review required. "
                 f"Matching records: {existing_accounts}"
             )
-            print(f"[Client {client_id}] Multiple matching accounts found.")
             return row
 
         if len(existing_accounts) == 1:
@@ -520,20 +496,12 @@ def process_client(pool, client_id, loan_id, existing_row):
 
             row["savingsId"] = savings_id
             row["existing_account_status"] = account_status
-
-            print(
-                f"[Client {client_id}] Existing CS account found: "
-                f"savingsId={savings_id}, status={account_status}"
-            )
-
             row["create_status"] = "SKIPPED_EXISTING"
 
         else:
             # -------------------------------------------------
             # C. NO EXISTING ACCOUNT: CREATE ONCE
             # -------------------------------------------------
-            print(f"[Client {client_id}] No existing CS account found.")
-
             create_result = create_cs_account(client_id, staff_id)
 
             row["create_http_status"] = create_result["http_status"]
@@ -557,11 +525,6 @@ def process_client(pool, client_id, loan_id, existing_row):
 
                     # A successfully created account starts at Pending (100).
                     account_status = STATUS_PENDING
-
-                    print(
-                        f"[Client {client_id}] Account created successfully. "
-                        f"savingsId={row['savingsId']}"
-                    )
                 else:
                     row["create_status"] = "REVIEW_RESPONSE"
                     row["create_error"] = (
@@ -572,8 +535,7 @@ def process_client(pool, client_id, loan_id, existing_row):
                     return row
 
             elif not create_result["success"]:
-                # If a request times out, the server may still have created the account. 
-                
+                # If a request times out, the server may still have created the account.
                 row["create_status"] = (
                     "CHECK_BEFORE_RETRY"
                     if create_result["http_status"] is None
@@ -599,11 +561,6 @@ def process_client(pool, client_id, loan_id, existing_row):
         # D. APPROVE IF STATUS IS 100
         # -------------------------------------------------
         if account_status == STATUS_PENDING:
-            print(
-                f"[Client {client_id}] Account status is 100 (Pending). "
-                "Approval is required."
-            )
-
             if not approve_account(row):
                 row["processing_result"] = "APPROVAL_FAILED"
                 return row
@@ -612,19 +569,11 @@ def process_client(pool, client_id, loan_id, existing_row):
 
         elif account_status == STATUS_APPROVED:
             row["approve_status"] = "SKIPPED_ALREADY_APPROVED"
-            print(
-                f"[Client {client_id}] Account status is 200 (Approved). "
-                "Skipping approval."
-            )
 
         elif account_status == STATUS_ACTIVATED:
             row["approve_status"] = "SKIPPED_ALREADY_APPROVED"
             row["activate_status"] = "SKIPPED_ALREADY_ACTIVATED"
             row["processing_result"] = "ALREADY_ACTIVATED"
-            print(
-                f"[Client {client_id}] Account status is 300 (Activated). "
-                "No further action required."
-            )
             return row
 
         else:
@@ -633,34 +582,22 @@ def process_client(pool, client_id, loan_id, existing_row):
                 f"Unsupported account status: {account_status}. "
                 "Manual review required."
             )
-            print(
-                f"[Client {client_id}] Unsupported account status "
-                f"{account_status}. Skipping."
-            )
             return row
 
         # -------------------------------------------------
         # E. ACTIVATE IF STATUS IS 200
         # -------------------------------------------------
         if account_status == STATUS_APPROVED:
-            print(
-                f"[Client {client_id}] Account status is 200 (Approved). "
-                "Activation is required."
-            )
-
             if not activate_account(row):
                 row["processing_result"] = "ACTIVATION_FAILED"
                 return row
 
             row["processing_result"] = "COMPLETED"
-            print(f"[Client {client_id}] CS Savings Account activated.")
 
         return row
 
     except Exception as exc:
         error_text = f"{type(exc).__name__}: {exc}"
-        print(f"[Client {client_id}] UNEXPECTED ERROR: {error_text}")
-
         row["processing_result"] = "UNEXPECTED_ERROR"
 
         if row["create_status"] == NOT_ATTEMPTED:
@@ -688,177 +625,210 @@ def process_client(pool, client_id, loan_id, existing_row):
 # =========================================================
 
 def main():
+    console = Console()
+
     if not TOKEN:
-        raise ValueError("Finflux API token is missing. Please configure TOKEN before running.")
+        console.print(
+            Panel(
+                "[bold red]Finflux API token is missing.[/bold red]\nPlease configure TOKEN before running.",
+                title="Configuration Error",
+                border_style="red",
+            )
+        )
+        return
 
     required_db_values = ["host", "user", "password", "database"]
     missing_db_values = [
-        name for name in required_db_values
-        if not DB_CONFIG.get(name)
-        or str(DB_CONFIG.get(name)).startswith("YOUR_")
+        name
+        for name in required_db_values
+        if not DB_CONFIG.get(name) or str(DB_CONFIG.get(name)).startswith("YOUR_")
     ]
 
     if missing_db_values:
-        raise ValueError(
-            "Please configure these database values: "
-            + ", ".join(missing_db_values)
+        console.print(
+            Panel(
+                f"[bold red]Missing database configuration values:[/bold red] {', '.join(missing_db_values)}",
+                title="Database Configuration Error",
+                border_style="red",
+            )
         )
+        return
 
     if MAX_WORKERS < 1:
-        raise ValueError("MAX_WORKERS must be at least 1.")
+        console.print("[bold red]MAX_WORKERS must be at least 1.[/bold red]")
+        return
 
     if BATCH_SIZE < 1:
-        raise ValueError("BATCH_SIZE must be at least 1.")
+        console.print("[bold red]BATCH_SIZE must be at least 1.[/bold red]")
+        return
 
     HEADERS["Authorization"] = f"Bearer {TOKEN}"
 
-    df = pd.read_excel(INPUT_FILE)
+    try:
+        df = pd.read_excel(INPUT_FILE)
+    except Exception as exc:
+        console.print(
+            Panel(
+                f"[bold red]Failed to read input Excel file '{INPUT_FILE}':[/bold red]\n{exc}",
+                title="Input File Error",
+                border_style="red",
+            )
+        )
+        return
 
     required_columns = ["client_id", "loan_id"]
     for column in required_columns:
         if column not in df.columns:
-            raise ValueError(
-                f"'{column}' not found in input file. "
-                f"Available columns: {df.columns.tolist()}"
+            console.print(
+                Panel(
+                    f"'{column}' column not found in input file.\nAvailable columns: {df.columns.tolist()}",
+                    title="Excel Schema Error",
+                    border_style="red",
+                )
             )
+            return
 
     df["client_id"] = pd.to_numeric(df["client_id"], errors="coerce")
     df = df.dropna(subset=["client_id"]).copy()
     df["client_id"] = df["client_id"].astype("int64")
     df = df.drop_duplicates(subset=["client_id"])
 
-    print("Unique clients in input file:", len(df))
-
     if TEST_ONE_CLIENT:
         df = df.head(1)
-        print("TEST_ONE_CLIENT is ON. Only the first client will be processed.")
-
-    if DRY_RUN:
-        print("DRY_RUN is ON. No API requests will be sent.")
-
-    # report = load_previous_report()
-    report = {}
 
     total_clients = len(df)
-    total_batches = (
-        total_clients + BATCH_SIZE - 1
-    ) // BATCH_SIZE
+    if total_clients == 0:
+        console.print(
+            Panel(
+                f"No valid client records found in '{INPUT_FILE}'.",
+                title="No Data",
+                border_style="yellow",
+            )
+        )
+        return
 
-    print(f"Total clients: {total_clients}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Total batches: {total_batches}")
-    print(f"MAX_WORKERS: {MAX_WORKERS}")
+    total_batches = (total_clients + BATCH_SIZE - 1) // BATCH_SIZE
 
-    if MAX_WORKERS == 1:
-        print("Execution mode: SEQUENTIAL")
-    else:
-        print(f"Execution mode: PARALLEL (up to {MAX_WORKERS} clients)")
-
-    db_pool = MySQLConnectionPool(
-        pool_name="savings_pool",
-        pool_size=MAX_WORKERS,
-        pool_reset_session=True,
-        **DB_CONFIG,
+    tui = InterestRateTUI(
+        total_clients=total_clients,
+        batch_size=BATCH_SIZE,
+        total_batches=total_batches,
+        dry_run=DRY_RUN,
+        test_one=TEST_ONE_CLIENT,
+    )
+    tui.display_header(
+        input_file=INPUT_FILE,
+        output_file=OUTPUT_FILE,
+        workers=MAX_WORKERS,
+        product_id=CS_PRODUCT_ID,
+        today_str=TODAY,
     )
 
-    for batch_number, batch_start in enumerate(
-        range(0, total_clients, BATCH_SIZE),
-        start=1,
-    ):
-        batch_df = df.iloc[batch_start:batch_start + BATCH_SIZE]
-
-        print("\n" + "#" * 65)
-        print(f"STARTING BATCH {batch_number}/{total_batches}")
-        print(f"Clients in this batch: {len(batch_df)}")
-        print("#" * 65)
-
-        jobs = []
-
-        for _, loan in batch_df.iterrows():
-            client_id = int(loan["client_id"])
-
-            loan_id_value = loan["loan_id"]
-            loan_id = (
-                int(loan_id_value)
-                if pd.notna(loan_id_value)
-                else None
+    try:
+        db_pool = MySQLConnectionPool(
+            pool_name="savings_pool",
+            pool_size=MAX_WORKERS,
+            pool_reset_session=True,
+            **DB_CONFIG,
+        )
+    except Exception as exc:
+        console.print(
+            Panel(
+                f"[bold red]Failed to establish MySQL connection pool:[/bold red]\n{exc}",
+                title="Database Connection Failure",
+                border_style="red",
             )
+        )
+        return
 
-            key = str(client_id)
+    report = {}
 
-            if key not in report:
-                report[key] = new_report_row(client_id, loan_id)
+    tui.start()
 
-            base_row = new_report_row(client_id, loan_id)
-            jobs.append((client_id, loan_id, base_row))
+    try:
+        for batch_number, batch_start in enumerate(
+            range(0, total_clients, BATCH_SIZE),
+            start=1,
+        ):
+            batch_df = df.iloc[batch_start : batch_start + BATCH_SIZE]
+            batch_len = len(batch_df)
 
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            future_to_client = {
-                executor.submit(
-                    process_client,
-                    db_pool,
-                    client_id,
-                    loan_id,
-                    base_row,
-                ): client_id
-                for client_id, loan_id, base_row in jobs
-            }
+            tui.start_batch(batch_number, batch_len)
 
-            completed = 0
-
-            for future in as_completed(future_to_client):
-                client_id = future_to_client[future]
+            jobs = []
+            for _, loan in batch_df.iterrows():
+                client_id = int(loan["client_id"])
+                loan_id_value = loan["loan_id"]
+                loan_id = int(loan_id_value) if pd.notna(loan_id_value) else None
                 key = str(client_id)
 
-                try:
-                    updated_row = future.result()
-                except Exception as exc:
-                    updated_row = new_report_row(client_id)
-                    updated_row["processing_result"] = "WORKER_FAILED"
-                    updated_row["create_status"] = "FAILED"
-                    updated_row["create_error"] = (
-                        f"Worker failure: {type(exc).__name__}: {exc}"
-                    )
+                if key not in report:
+                    report[key] = new_report_row(client_id, loan_id)
 
-                report[key] = updated_row
+                base_row = new_report_row(client_id, loan_id)
+                jobs.append((client_id, loan_id, base_row))
 
-                # Save after each completed client.
-                completed += 1
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_client = {
+                    executor.submit(
+                        process_client,
+                        db_pool,
+                        client_id,
+                        loan_id,
+                        base_row,
+                    ): client_id
+                    for client_id, loan_id, base_row in jobs
+                }
 
-                # Save periodically instead of after every client.
-                if completed % SAVE_INTERVAL == 0:
-                    save_report(report)
-                    print(f"[Report] Saved progress: {len(report)}/{total_clients} clients.")
+                completed_in_batch = 0
 
-                print(
-                    f"[Progress] Batch {batch_number}/{total_batches}: "
-                    f"{completed}/{len(jobs)} clients completed. "
-                    f"Latest client: {client_id}"
-                )
-        # Save after every completed batch.
+                for future in as_completed(future_to_client):
+                    client_id = future_to_client[future]
+                    key = str(client_id)
+
+                    try:
+                        updated_row = future.result()
+                    except Exception as exc:
+                        updated_row = new_report_row(client_id)
+                        updated_row["processing_result"] = "WORKER_FAILED"
+                        updated_row["create_status"] = "FAILED"
+                        updated_row["create_error"] = (
+                            f"Worker failure: {type(exc).__name__}: {exc}"
+                        )
+
+                    report[key] = updated_row
+                    completed_in_batch += 1
+
+                    tui.record_client(updated_row)
+
+                    if completed_in_batch % SAVE_INTERVAL == 0:
+                        save_report(report)
+                        tui.log_save(len(report), total_clients)
+
+            save_report(report)
+
+            if batch_number < total_batches:
+                tui.log_pause(BATCH_PAUSE_SECONDS, batch_number + 1, total_batches)
+                time.sleep(BATCH_PAUSE_SECONDS)
+
+    except KeyboardInterrupt:
+        tui.stop()
         save_report(report)
-
-        print(f"\nBATCH {batch_number}/{total_batches} COMPLETED")
-
-        if batch_number < total_batches:
-            print(
-                f"Waiting {BATCH_PAUSE_SECONDS} seconds "
-                "before the next batch..."
+        console.print(
+            Panel(
+                f"[bold yellow]Execution interrupted by user (Ctrl+C).[/bold yellow]\n"
+                f"Saved progress for {len(report)}/{total_clients} clients to '{OUTPUT_FILE}'.",
+                title="Execution Interrupted",
+                border_style="yellow",
             )
-            time.sleep(BATCH_PAUSE_SECONDS)
+        )
+        return
+
+    finally:
+        tui.stop()
 
     save_report(report)
-
-    print("\n" + "=" * 65)
-    print("PROCESSING FINISHED")
-    print(f"Report saved to: {OUTPUT_FILE}")
-    print(f"Total clients in input: {total_clients}")
-    print(f"Batch size: {BATCH_SIZE}")
-    print(f"Total batches: {total_batches}")
-    print(f"MAX_WORKERS: {MAX_WORKERS}")
-    print(f"Date used: {TODAY}")
-    print(f"Dry run: {DRY_RUN}")
-    print(f"Test one client: {TEST_ONE_CLIENT}")
+    tui.show_final_summary(OUTPUT_FILE)
 
 
 if __name__ == "__main__":
