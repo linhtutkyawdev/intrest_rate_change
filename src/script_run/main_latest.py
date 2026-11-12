@@ -20,7 +20,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "e6fa2627-56c3-4e19-9938-78713bb92ab9"
+TOKEN = "db2f744b-6f4e-4b47-835e-03ec7e0c7f36"
 
 # Database configuration
 DB_CONFIG = {
@@ -56,10 +56,10 @@ DRY_RUN = False
 TEST_ONE_CLIENT = False
 
 # Batch settings
-BATCH_SIZE = 20
-BATCH_PAUSE_SECONDS = 3
+BATCH_SIZE = 500
+BATCH_PAUSE_SECONDS = 1
 
-MAX_WORKERS = 5
+MAX_WORKERS = 15
 
 TODAY = date.today().strftime("%d %B %Y")
 
@@ -84,6 +84,8 @@ REPORT_COLUMNS = [
 ]
 
 NOT_ATTEMPTED = "NOT_ATTEMPTED"
+
+SAVE_INTERVAL = 100
 
 # =========================================================
 # STEP 2: REPORT FUNCTIONS
@@ -803,14 +805,20 @@ def main():
                 report[key] = updated_row
 
                 # Save after each completed client.
-                save_report(report)
-
                 completed += 1
+
+                # Save periodically instead of after every client.
+                if completed % SAVE_INTERVAL == 0:
+                    save_report(report)
+                    print(f"[Report] Saved progress: {len(report)}/{total_clients} clients.")
+
                 print(
                     f"[Progress] Batch {batch_number}/{total_batches}: "
                     f"{completed}/{len(jobs)} clients completed. "
                     f"Latest client: {client_id}"
                 )
+        # Save after every completed batch.
+        save_report(report)
 
         print(f"\nBATCH {batch_number}/{total_batches} COMPLETED")
 
