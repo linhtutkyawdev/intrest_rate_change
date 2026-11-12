@@ -2,9 +2,9 @@ import json
 import time
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import pandas as pd
 import mysql.connector
+from mysql.connector.pooling import MySQLConnectionPool
 import requests
 
 # =========================================================
@@ -90,6 +90,7 @@ SAVE_INTERVAL = 100
 # =========================================================
 # STEP 2: REPORT FUNCTIONS
 # =========================================================
+db_pool = None
 
 def new_report_row(client_id, loan_id=None):
     return {
@@ -436,7 +437,7 @@ def activate_account(row):
 # STEP 11: PROCESS ONE CLIENT
 # =========================================================
 
-def process_client(client_id, loan_id, existing_row):
+def process_client(pool, client_id, loan_id, existing_row):
     """
     Process one client.
 
@@ -460,38 +461,47 @@ def process_client(client_id, loan_id, existing_row):
     print(f"[Worker] Processing client_id={client_id}, loan_id={loan_id}")
 
     try:
-        conn = mysql.connector.connect(**DB_CONFIG)
+        conn = pool.get_connection()
         cursor = conn.cursor()
-
         # -------------------------------------------------
-        # A. GET STAFF ID
+        # A. GET STAFF ID + CHECK EXISTING CS ACCOUNT
         # -------------------------------------------------
         cursor.execute(
             """
-            SELECT staff_id
-            FROM m_client
-            WHERE id = %s
+            SELECT
+                mc.staff_id,
+                msa.id AS savings_id,
+                msa.status_enum AS account_status
+            FROM m_client mc
+            LEFT JOIN m_savings_account msa
+                ON msa.client_id = mc.id
+                AND msa.product_id = %s
+            WHERE mc.id = %s
             """,
-            (int(client_id),),
+            (CS_PRODUCT_ID, int(client_id)),
         )
-
-        client_result = cursor.fetchone()
-
-        if client_result is None or client_result[0] is None:
+        
+        results = cursor.fetchall()
+        
+        # Client does not exist or has no staff_id
+        if not results or results[0][0] is None:
             row["processing_result"] = "FAILED_NO_STAFF_ID"
             row["create_status"] = "FAILED"
             row["create_error"] = "No staff_id found in m_client."
             print(f"[Client {client_id}] No staff_id found. Skipping.")
             return row
-
-        staff_id = int(client_result[0])
+        
+        staff_id = int(results[0][0])
+        
         print(f"[Client {client_id}] staff_id={staff_id}")
-
-        # -------------------------------------------------
-        # B. CHECK EXISTING CS ACCOUNT
-        # -------------------------------------------------
-        existing_accounts = get_existing_cs_account(cursor, client_id)
-
+        
+        # Extract matching savings accounts
+        existing_accounts = [
+            (result[1], result[2])
+            for result in results
+            if result[1] is not None
+        ]
+        
         if len(existing_accounts) > 1:
             row["processing_result"] = "MULTIPLE_ACCOUNTS_REVIEW"
             row["create_status"] = "REVIEW_REQUIRED"
@@ -744,6 +754,13 @@ def main():
     else:
         print(f"Execution mode: PARALLEL (up to {MAX_WORKERS} clients)")
 
+    db_pool = MySQLConnectionPool(
+        pool_name="savings_pool",
+        pool_size=MAX_WORKERS,
+        pool_reset_session=True,
+        **DB_CONFIG,
+    )
+
     for batch_number, batch_start in enumerate(
         range(0, total_clients, BATCH_SIZE),
         start=1,
@@ -779,6 +796,7 @@ def main():
             future_to_client = {
                 executor.submit(
                     process_client,
+                    db_pool,
                     client_id,
                     loan_id,
                     base_row,
