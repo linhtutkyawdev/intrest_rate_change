@@ -47,7 +47,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "141725c1-47b9-417e-a18f-dfed81752884"
+TOKEN = "d45ff1c1-fb9f-491c-ae68-b9922a3bf5e9"
 
 # Database configuration
 DB_CONFIG = {
@@ -94,10 +94,11 @@ MAX_WORKERS = 15
 TODAY = date.today().strftime("%d %B %Y")
 
 REPORT_COLUMNS = [
-    "officeId",
-    "clientId",
+    "office_id",
+    "client_id",
     "loan_id",
-    "savingsId",
+    "csavings14_id",
+    "csavings12_id",
     "existing_account_status",
     "processing_result",
     "create_status",
@@ -122,12 +123,22 @@ SAVE_INTERVAL = 300
 _checkpoint_lock = threading.Lock()
 
 
-def new_report_row(client_id, loan_id=None):
+def format_id(val):
+    if val is None or pd.isna(val):
+        return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return val
+
+
+def new_report_row(client_id, loan_id=None, csavings14_id=None):
     return {
-        "officeId": None,
-        "clientId": int(client_id),
-        "loan_id": int(loan_id) if loan_id is not None else None,
-        "savingsId": None,
+        "office_id": None,
+        "client_id": int(client_id),
+        "loan_id": format_id(loan_id),
+        "csavings14_id": format_id(csavings14_id),
+        "csavings12_id": None,
         "existing_account_status": None,
         "processing_result": NOT_ATTEMPTED,
         "create_status": NOT_ATTEMPTED,
@@ -174,7 +185,7 @@ def load_checkpoint(checkpoint_path=CHECKPOINT_FILE):
                     continue
                 try:
                     row = json.loads(line)
-                    cid = row.get("clientId")
+                    cid = row.get("client_id")
                     if cid is not None:
                         cid = int(cid)
                         report[str(cid)] = row
@@ -201,19 +212,19 @@ def load_from_excel_fallback(output_file=OUTPUT_FILE, checkpoint_path=CHECKPOINT
 
     try:
         df_prev = pd.read_excel(output_file)
-        if "clientId" not in df_prev.columns:
+        if "client_id" not in df_prev.columns:
             return {}, set()
 
-        df_prev["clientId"] = pd.to_numeric(df_prev["clientId"], errors="coerce")
-        df_prev = df_prev.dropna(subset=["clientId"])
-        df_prev["clientId"] = df_prev["clientId"].astype("int64")
+        df_prev["client_id"] = pd.to_numeric(df_prev["client_id"], errors="coerce")
+        df_prev = df_prev.dropna(subset=["client_id"])
+        df_prev["client_id"] = df_prev["client_id"].astype("int64")
 
         report = {}
         completed_ids = set()
 
         for row in df_prev.to_dict(orient="records"):
             cleaned_row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
-            cid = int(cleaned_row["clientId"])
+            cid = int(cleaned_row["client_id"])
             report[str(cid)] = cleaned_row
             if cleaned_row.get("processing_result") in COMPLETED_RESULTS:
                 completed_ids.add(cid)
@@ -510,7 +521,7 @@ def create_cs_account(client_id, staff_id):
 # =========================================================
 
 def approve_account(row):
-    savings_id = row["savingsId"]
+    savings_id = row["csavings12_id"]
 
     if DRY_RUN:
         return False
@@ -542,7 +553,7 @@ def approve_account(row):
 # =========================================================
 
 def activate_account(row):
-    savings_id = row["savingsId"]
+    savings_id = row["csavings12_id"]
 
     if DRY_RUN:
         return False
@@ -573,7 +584,7 @@ def activate_account(row):
 # STEP 11: PROCESS ONE CLIENT
 # =========================================================
 
-def process_client(pool, client_id, loan_id, existing_row):
+def process_client(pool, client_id, loan_id, csavings14_id, existing_row):
     """
     Process one client.
 
@@ -585,10 +596,13 @@ def process_client(pool, client_id, loan_id, existing_row):
 
     """
     row = dict(existing_row)
-    row["clientId"] = int(client_id)
+    row["client_id"] = int(client_id)
 
-    if row["loan_id"] is None:
-        row["loan_id"] = loan_id
+    if row.get("loan_id") is None:
+        row["loan_id"] = format_id(loan_id)
+
+    if row.get("csavings14_id") is None:
+        row["csavings14_id"] = format_id(csavings14_id)
 
     conn = None
     cursor = None
@@ -647,7 +661,7 @@ def process_client(pool, client_id, loan_id, existing_row):
             savings_id = int(savings_id)
             account_status = int(account_status)
 
-            row["savingsId"] = savings_id
+            row["csavings12_id"] = savings_id
             row["existing_account_status"] = account_status
             row["create_status"] = "SKIPPED_EXISTING"
 
@@ -670,9 +684,9 @@ def process_client(pool, client_id, loan_id, existing_row):
                 required_fields = ["officeId", "clientId", "savingsId"]
 
                 if all(data.get(field) is not None for field in required_fields):
-                    row["officeId"] = data["officeId"]
-                    row["clientId"] = data["clientId"]
-                    row["savingsId"] = int(data["savingsId"])
+                    row["office_id"] = data["officeId"]
+                    row["client_id"] = data["clientId"]
+                    row["csavings12_id"] = int(data["savingsId"])
                     row["create_status"] = "SUCCESS"
                     row["create_error"] = None
 
@@ -853,6 +867,17 @@ def main():
             )
             return
 
+    if "csavings14_id" not in df.columns:
+        console.print(
+            Panel(
+                f"[bold yellow]'csavings14_id' column not found in input file '{INPUT_FILE}'.[/bold yellow]\n"
+                f"Available columns: {df.columns.tolist()}\n"
+                f"'csavings14_id' will default to None in output.",
+                title="Input Schema Notice",
+                border_style="yellow",
+            )
+        )
+
     df["client_id"] = pd.to_numeric(df["client_id"], errors="coerce")
     df = df.dropna(subset=["client_id"]).copy()
     df["client_id"] = df["client_id"].astype("int64")
@@ -880,6 +905,38 @@ def main():
         report, completed_client_ids = load_checkpoint(CHECKPOINT_FILE)
         if not completed_client_ids and os.path.exists(OUTPUT_FILE):
             report, completed_client_ids = load_from_excel_fallback(OUTPUT_FILE, CHECKPOINT_FILE)
+
+    # Synchronize input file columns (csavings14_id, loan_id) into existing report records
+    # This ensures that even already-completed clients receive new/upgraded input data upon rerun
+    has_cs14 = "csavings14_id" in df.columns
+    cols_to_extract = ["client_id", "loan_id"]
+    if has_cs14:
+        cols_to_extract.append("csavings14_id")
+
+    input_meta = {}
+    for row_tuple in df[cols_to_extract].itertuples(index=False):
+        cid = int(row_tuple[0])
+        lid = format_id(row_tuple[1])
+        cs14 = format_id(row_tuple[2]) if has_cs14 else None
+        input_meta[str(cid)] = (lid, cs14)
+
+    updated_existing = False
+    for key, r in report.items():
+        if key in input_meta:
+            lid, cs14 = input_meta[key]
+            if cs14 is not None and r.get("csavings14_id") != cs14:
+                r["csavings14_id"] = cs14
+                updated_existing = True
+            if lid is not None and r.get("loan_id") != lid:
+                r["loan_id"] = lid
+                updated_existing = True
+
+    if updated_existing:
+        with _checkpoint_lock:
+            with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+                for r in report.values():
+                    f.write(json.dumps(r) + "\n")
+        save_report(report)
 
     # Filter out only completed clients. Retries any failed, review, or unattempted records!
     remaining_df = df[~df["client_id"].isin(completed_client_ids)].copy()
@@ -957,14 +1014,21 @@ def main():
             for _, loan in batch_df.iterrows():
                 client_id = int(loan["client_id"])
                 loan_id_value = loan["loan_id"]
-                loan_id = int(loan_id_value) if pd.notna(loan_id_value) else None
+                loan_id = format_id(loan_id_value)
+
+                csavings14_val = loan.get("csavings14_id") if "csavings14_id" in loan else None
+                csavings14_id = format_id(csavings14_val)
+
                 key = str(client_id)
 
                 if key not in report:
-                    report[key] = new_report_row(client_id, loan_id)
+                    report[key] = new_report_row(client_id, loan_id, csavings14_id)
+                else:
+                    if report[key].get("csavings14_id") is None and csavings14_id is not None:
+                        report[key]["csavings14_id"] = csavings14_id
 
-                base_row = new_report_row(client_id, loan_id)
-                jobs.append((client_id, loan_id, base_row))
+                base_row = new_report_row(client_id, loan_id, csavings14_id)
+                jobs.append((client_id, loan_id, csavings14_id, base_row))
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_client = {
@@ -973,21 +1037,22 @@ def main():
                         db_pool,
                         client_id,
                         loan_id,
+                        csavings14_id,
                         base_row,
-                    ): client_id
-                    for client_id, loan_id, base_row in jobs
+                    ): (client_id, loan_id, csavings14_id)
+                    for client_id, loan_id, csavings14_id, base_row in jobs
                 }
 
                 completed_in_batch = 0
 
                 for future in as_completed(future_to_client):
-                    client_id = future_to_client[future]
+                    client_id, loan_id, csavings14_id = future_to_client[future]
                     key = str(client_id)
 
                     try:
                         updated_row = future.result()
                     except Exception as exc:
-                        updated_row = new_report_row(client_id)
+                        updated_row = new_report_row(client_id, loan_id, csavings14_id)
                         updated_row["processing_result"] = "WORKER_FAILED"
                         updated_row["create_status"] = "FAILED"
                         updated_row["create_error"] = (

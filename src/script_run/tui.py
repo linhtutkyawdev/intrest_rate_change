@@ -186,8 +186,8 @@ class InterestRateTUI:
                 self.live.update(self._render_view())
     def record_client(self, row: dict):
         with self._lock:
-            client_id = row.get("clientId")
-            savings_id = row.get("savingsId")
+            client_id = row.get("client_id")
+            savings_id = row.get("csavings12_id")
             res = row.get("processing_result", "UNKNOWN")
 
             if res == "COMPLETED":
