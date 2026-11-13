@@ -6,6 +6,10 @@ import pandas as pd
 import mysql.connector
 from mysql.connector.pooling import MySQLConnectionPool
 import requests
+import threading
+from requests.adapters import HTTPAdapter
+
+_thread_local = threading.local()
 
 from rich.console import Console
 from rich.panel import Panel
@@ -29,7 +33,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "b4bb08a5-940d-48dc-ac4e-d8ed7e543f4a"
+TOKEN = "df0ee6f8-de39-4f8c-b492-aa49ec02e389"
 
 # Database configuration
 DB_CONFIG = {
@@ -273,16 +277,36 @@ def build_payload(client_id, staff_id):
 # =========================================================
 # STEP 6: GENERIC API REQUEST FUNCTION
 # =========================================================
+def get_http_session():
+    if not hasattr(_thread_local, "session"):
+        session = requests.Session()
+
+        adapter = HTTPAdapter(
+            pool_connections=1,
+            pool_maxsize=1,
+            max_retries=0,
+        )
+
+        session.mount("https://", adapter)
+        session.mount("http://", adapter)
+
+        _thread_local.session = session
+
+    return _thread_local.session
 
 def call_api(method, url, payload=None):
     try:
-        response = requests.request(
-            method=method,
-            url=url,
-            headers=HEADERS,
-            json=payload,
-            timeout=(10, 60),
+        session = get_http_session()
+        response = session.post(
+            url, json=payload, headers=HEADERS, timeout=120
         )
+        # response = requests.request(
+        #     method=method,
+        #     url=url,
+        #     headers=HEADERS,
+        #     json=payload,
+        #     timeout=(10, 60),
+        # )
 
         try:
             data = response.json()
