@@ -88,6 +88,7 @@ class InterestRateTUI:
         workers: int,
         product_id: int,
         today_str: str,
+        resumed_count: int = 0,
     ):
         banner_text = Text(ASCII_BANNER.strip("\n"), style="bold cyan", justify="center")
         header_panel = Panel(
@@ -112,6 +113,8 @@ class InterestRateTUI:
         )
         if self.test_one:
             mode_str += " [italic](Test 1 Client)[/italic]"
+        if resumed_count > 0:
+            mode_str += f" [bold cyan](Resumed: {resumed_count:,} skipped)[/bold cyan]"
 
         grid.add_row(
             "[bold]Input File:[/bold]",
@@ -144,6 +147,21 @@ class InterestRateTUI:
             border_style="blue",
         )
         self.console.print(config_panel)
+
+    def preload_completed_stats(self, rows: list):
+        """Pre-populate stats and advance overall progress for resumed sessions."""
+        with self._lock:
+            for row in rows:
+                res = row.get("processing_result", "UNKNOWN")
+                if res in ("COMPLETED", "DRY_RUN"):
+                    self.stats["completed"] += 1
+                elif res == "ALREADY_ACTIVATED":
+                    self.stats["already_active"] += 1
+                self.stats["total"] += 1
+
+            self.prog.advance(self.overall_task, len(rows))
+            if self.live:
+                self.live.update(self._render_view())
 
     def start(self):
         self.start_time = time.time()

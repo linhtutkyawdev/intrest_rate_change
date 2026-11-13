@@ -1,4 +1,7 @@
 import json
+import os
+import signal
+import tempfile
 import time
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -26,6 +29,17 @@ except ImportError:
 
 INPUT_FILE = "loan_list.xlsx"
 OUTPUT_FILE = "created_savings_accounts.xlsx"
+CHECKPOINT_FILE = "savings_accounts_checkpoint.jsonl"
+
+# Resume settings
+RESUME_IF_EXISTS = True
+
+# Terminal statuses that should NOT be re-processed on resume.
+# Every other status (failed, timeout, review, not attempted) will be retried on resume.
+COMPLETED_RESULTS = {
+    "COMPLETED",
+    "ALREADY_ACTIVATED",
+}
 
 API_BASE_URL = (
     "https://hanastaging.finflux.io/"
@@ -33,7 +47,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "df0ee6f8-de39-4f8c-b492-aa49ec02e389"
+TOKEN = "141725c1-47b9-417e-a18f-dfed81752884"
 
 # Database configuration
 DB_CONFIG = {
@@ -68,6 +82,9 @@ STATUS_ACTIVATED = 300
 DRY_RUN = False
 TEST_ONE_CLIENT = False
 
+if DRY_RUN:
+    COMPLETED_RESULTS.add("DRY_RUN")
+
 # Batch settings
 BATCH_SIZE = 300
 BATCH_PAUSE_SECONDS = 1
@@ -96,11 +113,14 @@ REPORT_COLUMNS = [
 
 NOT_ATTEMPTED = "NOT_ATTEMPTED"
 
-SAVE_INTERVAL = 100
+SAVE_INTERVAL = 300
 
 # =========================================================
-# STEP 2: REPORT FUNCTIONS
+# STEP 2: REPORT & CHECKPOINT FUNCTIONS
 # =========================================================
+
+_checkpoint_lock = threading.Lock()
+
 
 def new_report_row(client_id, loan_id=None):
     return {
@@ -122,12 +142,121 @@ def new_report_row(client_id, loan_id=None):
     }
 
 
-def save_report(report):
+def append_to_checkpoint(row, checkpoint_path=CHECKPOINT_FILE):
+    """
+    Append a single processed client record as JSON to the checkpoint file.
+    Fast (<0.1ms), thread-safe, and crash-proof for 40k+ volume.
+    """
+    line = json.dumps(row) + "\n"
+    with _checkpoint_lock:
+        with open(checkpoint_path, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+def load_checkpoint(checkpoint_path=CHECKPOINT_FILE):
+    """
+    Load previous progress from the JSONL checkpoint file.
+    Returns:
+        report (dict): {str(client_id): row_dict} (latest state per client)
+        completed_client_ids (set): set of client_id ints to skip (COMPLETED / ALREADY_ACTIVATED)
+    """
+    if not os.path.exists(checkpoint_path):
+        return {}, set()
+
+    report = {}
+    completed_ids = set()
+
+    try:
+        with open(checkpoint_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    cid = row.get("clientId")
+                    if cid is not None:
+                        cid = int(cid)
+                        report[str(cid)] = row
+                except json.JSONDecodeError:
+                    continue
+
+        for str_cid, row in report.items():
+            if row.get("processing_result") in COMPLETED_RESULTS:
+                completed_ids.add(int(str_cid))
+
+        return report, completed_ids
+    except Exception as exc:
+        print(f"Warning: Failed to load checkpoint from '{checkpoint_path}': {exc}")
+        return {}, set()
+
+
+def load_from_excel_fallback(output_file=OUTPUT_FILE, checkpoint_path=CHECKPOINT_FILE):
+    """
+    Fallback if checkpoint JSONL does not exist but previous Excel output file exists.
+    Populates report, identifies completed IDs, and initializes the JSONL checkpoint.
+    """
+    if not os.path.exists(output_file):
+        return {}, set()
+
+    try:
+        df_prev = pd.read_excel(output_file)
+        if "clientId" not in df_prev.columns:
+            return {}, set()
+
+        df_prev["clientId"] = pd.to_numeric(df_prev["clientId"], errors="coerce")
+        df_prev = df_prev.dropna(subset=["clientId"])
+        df_prev["clientId"] = df_prev["clientId"].astype("int64")
+
+        report = {}
+        completed_ids = set()
+
+        for row in df_prev.to_dict(orient="records"):
+            cleaned_row = {k: (None if pd.isna(v) else v) for k, v in row.items()}
+            cid = int(cleaned_row["clientId"])
+            report[str(cid)] = cleaned_row
+            if cleaned_row.get("processing_result") in COMPLETED_RESULTS:
+                completed_ids.add(cid)
+
+        # Write to checkpoint file for fast subsequent resumes
+        with _checkpoint_lock:
+            with open(checkpoint_path, "w", encoding="utf-8") as f:
+                for row in report.values():
+                    f.write(json.dumps(row) + "\n")
+
+        return report, completed_ids
+    except Exception as exc:
+        print(f"Warning: Failed to load previous Excel file '{output_file}': {exc}")
+        return {}, set()
+
+
+def save_report(report, output_file=OUTPUT_FILE):
+    """
+    Atomically write report to Excel using a temporary file and rename.
+    Guarantees that OUTPUT_FILE is never corrupted if interrupted mid-write.
+    """
+    if not report:
+        return
+
     output_df = pd.DataFrame(
         list(report.values()),
         columns=REPORT_COLUMNS,
     )
-    output_df.to_excel(OUTPUT_FILE, index=False)
+
+    dir_name = os.path.dirname(os.path.abspath(output_file)) or "."
+    with tempfile.NamedTemporaryFile(delete=False, dir=dir_name, suffix=".tmp.xlsx") as tmp:
+        tmp_path = tmp.name
+
+    try:
+        output_df.to_excel(tmp_path, index=False)
+        os.replace(tmp_path, output_file)
+    except Exception as exc:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise exc
 
 # =========================================================
 # STEP 3: DATABASE LOOKUP
@@ -651,6 +780,18 @@ def process_client(pool, client_id, loan_id, existing_row):
 def main():
     console = Console()
 
+    # Graceful signal handling (Ctrl+C, SIGTERM)
+    shutdown_requested = threading.Event()
+
+    def handle_signal(sig, frame):
+        shutdown_requested.set()
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except (ValueError, AttributeError):
+        pass
+
     if not TOKEN:
         console.print(
             Panel(
@@ -731,7 +872,34 @@ def main():
         )
         return
 
-    total_batches = (total_clients + BATCH_SIZE - 1) // BATCH_SIZE
+    # Check for existing checkpoint or previous Excel report to resume
+    report = {}
+    completed_client_ids = set()
+
+    if RESUME_IF_EXISTS:
+        report, completed_client_ids = load_checkpoint(CHECKPOINT_FILE)
+        if not completed_client_ids and os.path.exists(OUTPUT_FILE):
+            report, completed_client_ids = load_from_excel_fallback(OUTPUT_FILE, CHECKPOINT_FILE)
+
+    # Filter out only completed clients. Retries any failed, review, or unattempted records!
+    remaining_df = df[~df["client_id"].isin(completed_client_ids)].copy()
+    clients_to_process = len(remaining_df)
+    resumed_count = len(completed_client_ids)
+
+    if clients_to_process == 0:
+        console.print(
+            Panel(
+                f"[bold green]All {total_clients:,} clients have already been completed![/bold green]\n"
+                f"Output file: '{OUTPUT_FILE}'\n"
+                f"Checkpoint file: '{CHECKPOINT_FILE}'",
+                title="All Records Completed",
+                border_style="green",
+            )
+        )
+        save_report(report)
+        return
+
+    total_batches = (clients_to_process + BATCH_SIZE - 1) // BATCH_SIZE
 
     tui = InterestRateTUI(
         total_clients=total_clients,
@@ -746,7 +914,12 @@ def main():
         workers=MAX_WORKERS,
         product_id=CS_PRODUCT_ID,
         today_str=TODAY,
+        resumed_count=resumed_count,
     )
+
+    if resumed_count > 0:
+        preload_rows = [report[str(cid)] for cid in completed_client_ids if str(cid) in report]
+        tui.preload_completed_stats(preload_rows)
 
     try:
         db_pool = MySQLConnectionPool(
@@ -765,16 +938,17 @@ def main():
         )
         return
 
-    report = {}
-
     tui.start()
 
     try:
         for batch_number, batch_start in enumerate(
-            range(0, total_clients, BATCH_SIZE),
+            range(0, clients_to_process, BATCH_SIZE),
             start=1,
         ):
-            batch_df = df.iloc[batch_start : batch_start + BATCH_SIZE]
+            if shutdown_requested.is_set():
+                break
+
+            batch_df = remaining_df.iloc[batch_start : batch_start + BATCH_SIZE]
             batch_len = len(batch_df)
 
             tui.start_batch(batch_number, batch_len)
@@ -821,6 +995,7 @@ def main():
                         )
 
                     report[key] = updated_row
+                    append_to_checkpoint(updated_row)
                     completed_in_batch += 1
 
                     tui.record_client(updated_row)
@@ -831,27 +1006,36 @@ def main():
 
             save_report(report)
 
+            if shutdown_requested.is_set():
+                break
+
             if batch_number < total_batches:
                 tui.log_pause(BATCH_PAUSE_SECONDS, batch_number + 1, total_batches)
                 time.sleep(BATCH_PAUSE_SECONDS)
 
     except KeyboardInterrupt:
-        tui.stop()
-        save_report(report)
-        console.print(
-            Panel(
-                f"[bold yellow]Execution interrupted by user (Ctrl+C).[/bold yellow]\n"
-                f"Saved progress for {len(report)}/{total_clients} clients to '{OUTPUT_FILE}'.",
-                title="Execution Interrupted",
-                border_style="yellow",
-            )
-        )
-        return
+        shutdown_requested.set()
 
     finally:
         tui.stop()
 
     save_report(report)
+
+    if shutdown_requested.is_set():
+        console.print(
+            Panel(
+                f"[bold yellow]Execution paused / interrupted.[/bold yellow]\n\n"
+                f"• Checkpoint saved: [bold cyan]{len(report):,}[/bold cyan] client states recorded in '{CHECKPOINT_FILE}'.\n"
+                f"• Excel report updated: [bold cyan]'{OUTPUT_FILE}'[/bold cyan].\n\n"
+                f"[bold green]To resume, simply run the script again![/bold green]\n"
+                f"All successfully completed records ({len(completed_client_ids):,}) will be skipped;\n"
+                f"any interrupted or failed records will be automatically retried.",
+                title="Execution Interrupted — Checkpoint Saved",
+                border_style="yellow",
+            )
+        )
+        return
+
     tui.show_final_summary(OUTPUT_FILE)
 
 
