@@ -116,7 +116,6 @@ TODAY = date.today().strftime("%d %B %Y")
 REPORT_COLUMNS = [
     "office_id",
     "client_id",
-    "loan_id",
     "csavings14_id",
     "csavings12_id",
     "existing_account_status",
@@ -152,11 +151,10 @@ def format_id(val):
         return val
 
 
-def new_report_row(client_id, loan_id=None, csavings14_id=None):
+def new_report_row(client_id, csavings14_id=None):
     return {
         "office_id": None,
         "client_id": int(client_id),
-        "loan_id": format_id(loan_id),
         "csavings14_id": format_id(csavings14_id),
         "csavings12_id": None,
         "existing_account_status": None,
@@ -670,7 +668,7 @@ def activate_account(row):
 # STEP 11: PROCESS ONE CLIENT
 # =========================================================
 
-def process_client(pool, client_id, loan_id, csavings14_id, existing_row):
+def process_client(pool, client_id, csavings14_id, existing_row):
     """
     Process one client.
 
@@ -683,9 +681,6 @@ def process_client(pool, client_id, loan_id, csavings14_id, existing_row):
     """
     row = dict(existing_row)
     row["client_id"] = int(client_id)
-
-    if row.get("loan_id") is None:
-        row["loan_id"] = format_id(loan_id)
 
     if row.get("csavings14_id") is None:
         row["csavings14_id"] = format_id(csavings14_id)
@@ -947,17 +942,15 @@ def main():
         )
         return
 
-    required_columns = ["client_id", "loan_id"]
-    for column in required_columns:
-        if column not in df.columns:
-            console.print(
-                Panel(
-                    f"'{column}' column not found in input file.\nAvailable columns: {df.columns.tolist()}",
-                    title="Excel Schema Error",
-                    border_style="red",
-                )
+    if "client_id" not in df.columns:
+        console.print(
+            Panel(
+                f"'client_id' column not found in input file.\nAvailable columns: {df.columns.tolist()}",
+                title="Excel Schema Error",
+                border_style="red",
             )
-            return
+        )
+        return
 
     if "csavings14_id" not in df.columns:
         console.print(
@@ -998,29 +991,25 @@ def main():
         if not completed_client_ids and os.path.exists(OUTPUT_FILE):
             report, completed_client_ids = load_from_excel_fallback(OUTPUT_FILE, CHECKPOINT_FILE)
 
-    # Synchronize input file columns (csavings14_id, loan_id) into existing report records
+    # Synchronize input file columns (csavings14_id) into existing report records
     # This ensures that even already-completed clients receive new/upgraded input data upon rerun
     has_cs14 = "csavings14_id" in df.columns
-    cols_to_extract = ["client_id", "loan_id"]
+    cols_to_extract = ["client_id"]
     if has_cs14:
         cols_to_extract.append("csavings14_id")
 
     input_meta = {}
     for row_tuple in df[cols_to_extract].itertuples(index=False):
         cid = int(row_tuple[0])
-        lid = format_id(row_tuple[1])
-        cs14 = format_id(row_tuple[2]) if has_cs14 else None
-        input_meta[str(cid)] = (lid, cs14)
+        cs14 = format_id(row_tuple[1]) if has_cs14 else None
+        input_meta[str(cid)] = cs14
 
     updated_existing = False
     for key, r in report.items():
         if key in input_meta:
-            lid, cs14 = input_meta[key]
+            cs14 = input_meta[key]
             if cs14 is not None and r.get("csavings14_id") != cs14:
                 r["csavings14_id"] = cs14
-                updated_existing = True
-            if lid is not None and r.get("loan_id") != lid:
-                r["loan_id"] = lid
                 updated_existing = True
 
     if updated_existing:
@@ -1103,24 +1092,22 @@ def main():
             tui.start_batch(batch_number, batch_len)
 
             jobs = []
-            for _, loan in batch_df.iterrows():
-                client_id = int(loan["client_id"])
-                loan_id_value = loan["loan_id"]
-                loan_id = format_id(loan_id_value)
+            for _, client_row in batch_df.iterrows():
+                client_id = int(client_row["client_id"])
 
-                csavings14_val = loan.get("csavings14_id") if "csavings14_id" in loan else None
+                csavings14_val = client_row.get("csavings14_id") if "csavings14_id" in client_row else None
                 csavings14_id = format_id(csavings14_val)
 
                 key = str(client_id)
 
                 if key not in report:
-                    report[key] = new_report_row(client_id, loan_id, csavings14_id)
+                    report[key] = new_report_row(client_id, csavings14_id)
                 else:
                     if report[key].get("csavings14_id") is None and csavings14_id is not None:
                         report[key]["csavings14_id"] = csavings14_id
 
-                base_row = new_report_row(client_id, loan_id, csavings14_id)
-                jobs.append((client_id, loan_id, csavings14_id, base_row))
+                base_row = new_report_row(client_id, csavings14_id)
+                jobs.append((client_id, csavings14_id, base_row))
 
             with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
                 future_to_client = {
@@ -1128,23 +1115,22 @@ def main():
                         process_client,
                         db_pool,
                         client_id,
-                        loan_id,
                         csavings14_id,
                         base_row,
-                    ): (client_id, loan_id, csavings14_id)
-                    for client_id, loan_id, csavings14_id, base_row in jobs
+                    ): (client_id, csavings14_id)
+                    for client_id, csavings14_id, base_row in jobs
                 }
 
                 completed_in_batch = 0
 
                 for future in as_completed(future_to_client):
-                    client_id, loan_id, csavings14_id = future_to_client[future]
+                    client_id, csavings14_id = future_to_client[future]
                     key = str(client_id)
 
                     try:
                         updated_row = future.result()
                     except Exception as exc:
-                        updated_row = new_report_row(client_id, loan_id, csavings14_id)
+                        updated_row = new_report_row(client_id, csavings14_id)
                         updated_row["processing_result"] = "WORKER_FAILED"
                         updated_row["create_status"] = "FAILED"
                         updated_row["create_error"] = (
