@@ -47,7 +47,7 @@ API_BASE_URL = (
 )
 
 # eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "d45ff1c1-fb9f-491c-ae68-b9922a3bf5e9"
+TOKEN = "209873c6-16de-4062-88ad-a4a13a4a987a"
 
 # Database configuration
 DB_CONFIG = {
@@ -273,33 +273,34 @@ def save_report(report, output_file=OUTPUT_FILE):
 # STEP 3: DATABASE LOOKUP
 # =========================================================
 
-def get_existing_cs_account(cursor, client_id):
-    """
-    Return all CS accounts matching this client and product.   
-    """
-    identifiers = [
-        ACCOUNT_TABLE,
-        ACCOUNT_ID_COLUMN,
-        ACCOUNT_CLIENT_ID_COLUMN,
-        ACCOUNT_PRODUCT_ID_COLUMN,
-        ACCOUNT_STATUS_COLUMN,
-    ]
+# def get_existing_cs_account(cursor, client_id):
+#     """
+#     Return all CS accounts matching this client and product.   
+#     """
+#     identifiers = [
+#         ACCOUNT_TABLE,
+#         ACCOUNT_ID_COLUMN,
+#         ACCOUNT_CLIENT_ID_COLUMN,
+#         ACCOUNT_PRODUCT_ID_COLUMN,
+#         ACCOUNT_STATUS_COLUMN,
+#     ]
 
-    for identifier in identifiers:
-        if not identifier.replace("_", "").isalnum():
-            raise ValueError(f"Invalid SQL identifier: {identifier}")
+#     for identifier in identifiers:
+#         if not identifier.replace("_", "").isalnum():
+#             raise ValueError(f"Invalid SQL identifier: {identifier}")
 
-    query = f"""
-        SELECT
-            `{ACCOUNT_ID_COLUMN}`,
-            `{ACCOUNT_STATUS_COLUMN}`
-        FROM `{ACCOUNT_TABLE}`
-        WHERE `{ACCOUNT_CLIENT_ID_COLUMN}` = %s
-          AND `{ACCOUNT_PRODUCT_ID_COLUMN}` = %s
-    """
+#     query = f"""
+#         SELECT
+#             `{ACCOUNT_ID_COLUMN}`,
+#             `{ACCOUNT_STATUS_COLUMN}`
+#         FROM `{ACCOUNT_TABLE}`
+#         WHERE `{ACCOUNT_CLIENT_ID_COLUMN}` = %s
+#           AND `{ACCOUNT_PRODUCT_ID_COLUMN}` = %s
+#           AND `{ACCOUNT_STATUS_COLUMN}` is not %s
+#     """
 
-    cursor.execute(query, (int(client_id), int(CS_PRODUCT_ID)))
-    return cursor.fetchall()
+#     cursor.execute(query, (int(client_id), int(CS_PRODUCT_ID)), STATUS_CLOSED)
+#     return cursor.fetchall()
 
 # =========================================================
 # STEP 4: EXTRACT API ERROR
@@ -623,6 +624,7 @@ def process_client(pool, client_id, loan_id, csavings14_id, existing_row):
             LEFT JOIN m_savings_account msa
                 ON msa.client_id = mc.id
                 AND msa.product_id = %s
+                AND msa.status_enum in (100, 200, 300)
             WHERE mc.id = %s
             """,
             (CS_PRODUCT_ID, int(client_id)),
