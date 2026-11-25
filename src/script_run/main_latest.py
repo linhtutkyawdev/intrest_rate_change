@@ -11,6 +11,10 @@ from mysql.connector.pooling import MySQLConnectionPool
 import requests
 import threading
 from requests.adapters import HTTPAdapter
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 _thread_local = threading.local()
 
@@ -24,15 +28,16 @@ except ImportError:
 
 
 # =========================================================
-# STEP 1: CONFIGURATION
+# STEP 1: CONFIGURATION (Loaded from .env with defaults)
 # =========================================================
 
-INPUT_FILE = "loan_list.xlsx"
-OUTPUT_FILE = "created_savings_accounts.xlsx"
-CHECKPOINT_FILE = "savings_accounts_checkpoint.jsonl"
+# File & Checkpoint paths
+INPUT_FILE = os.getenv("INPUT_FILE", "loan_list.xlsx")
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "created_savings_accounts.xlsx")
+CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "savings_accounts_checkpoint.jsonl")
 
 # Resume settings
-RESUME_IF_EXISTS = True
+RESUME_IF_EXISTS = os.getenv("RESUME_IF_EXISTS", "True").strip().lower() in ("true", "1", "yes")
 
 # Terminal statuses that should NOT be re-processed on resume.
 # Every other status (failed, timeout, review, not attempted) will be retried on resume.
@@ -41,55 +46,70 @@ COMPLETED_RESULTS = {
     "ALREADY_ACTIVATED",
 }
 
-API_BASE_URL = (
-    "https://hanastaging.finflux.io/"
-    "fineract-provider/api/v1/recurringdepositaccounts"
+# OAuth & Finflux API configuration
+FINERACT_OAUTH_URL = os.getenv(
+    "FINERACT_OAUTH_URL",
+    "https://hanastaging.finflux.io/fineract-provider/api/oauth/token",
+)
+FINERACT_TENANT_ID = os.getenv("FINERACT_TENANT_ID", "hanastaging")
+FINERACT_USERNAME = os.getenv("FINERACT_USERNAME", "autoteam")
+FINERACT_PASSWORD = os.getenv("FINERACT_PASSWORD", "AutoTeam@#2026")
+FINERACT_CLIENT_ID = os.getenv("FINERACT_CLIENT_ID", "community-app")
+FINERACT_CLIENT_SECRET = os.getenv("FINERACT_CLIENT_SECRET", "123")
+FINERACT_GRANT_TYPE = os.getenv("FINERACT_GRANT_TYPE", "password")
+
+API_BASE_URL = os.getenv(
+    "FINERACT_API_BASE_URL",
+    os.getenv(
+        "API_BASE_URL",
+        "https://hanastaging.finflux.io/fineract-provider/api/v1/recurringdepositaccounts",
+    ),
 )
 
-# eg. 17f5fd3c-6233-4b0f-b9ba-cc3a5020121a
-TOKEN = "209873c6-16de-4062-88ad-a4a13a4a987a"
+# Optional static token override; if empty, token is obtained automatically via OAuth
+TOKEN = os.getenv("FINERACT_TOKEN", os.getenv("TOKEN", "")).strip()
 
 # Database configuration
 DB_CONFIG = {
-    "host": "123.253.22.190",
-    "port": 3366,
-    "user": "hmf_uat_application_user",
-    "password": "App@2026UAT",
-    "database": "hmf_uat_finflux_db",
+    "host": os.getenv("DB_HOST", "123.253.22.190"),
+    "port": int(os.getenv("DB_PORT", "3366")),
+    "user": os.getenv("DB_USER", "hmf_uat_application_user"),
+    "password": os.getenv("DB_PASSWORD", "App@2026UAT"),
+    "database": os.getenv("DB_DATABASE", "hmf_uat_finflux_db"),
 }
 
 HEADERS = {
-    "Authorization": f"Bearer {TOKEN}",
+    "Authorization": f"Bearer {TOKEN}" if TOKEN else "",
     "Content-Type": "application/json;charset=UTF-8",
-    "fineract-platform-tenantid": "hanastaging",
+    "fineract-platform-tenantid": FINERACT_TENANT_ID,
 }
 
 # Existing account lookup configuration.
-ACCOUNT_TABLE = "m_savings_account"
-ACCOUNT_ID_COLUMN = "id"
-ACCOUNT_CLIENT_ID_COLUMN = "client_id"
-ACCOUNT_PRODUCT_ID_COLUMN = "product_id"
-ACCOUNT_STATUS_COLUMN = "status_enum"
+ACCOUNT_TABLE = os.getenv("ACCOUNT_TABLE", "m_savings_account")
+ACCOUNT_ID_COLUMN = os.getenv("ACCOUNT_ID_COLUMN", "id")
+ACCOUNT_CLIENT_ID_COLUMN = os.getenv("ACCOUNT_CLIENT_ID_COLUMN", "client_id")
+ACCOUNT_PRODUCT_ID_COLUMN = os.getenv("ACCOUNT_PRODUCT_ID_COLUMN", "product_id")
+ACCOUNT_STATUS_COLUMN = os.getenv("ACCOUNT_STATUS_COLUMN", "status_enum")
 
-CS_PRODUCT_ID = 46 # Product ID of Finflux Staging Env
+CS_PRODUCT_ID = int(os.getenv("CS_PRODUCT_ID", "46"))  # Product ID of Finflux Staging Env
 
 # FinFlux account status values
-STATUS_PENDING = 100
-STATUS_APPROVED = 200
-STATUS_ACTIVATED = 300
+STATUS_PENDING = int(os.getenv("STATUS_PENDING", "100"))
+STATUS_APPROVED = int(os.getenv("STATUS_APPROVED", "200"))
+STATUS_ACTIVATED = int(os.getenv("STATUS_ACTIVATED", "300"))
 
 # Safety settings
-DRY_RUN = False
-TEST_ONE_CLIENT = False
+DRY_RUN = os.getenv("DRY_RUN", "False").strip().lower() in ("true", "1", "yes")
+TEST_ONE_CLIENT = os.getenv("TEST_ONE_CLIENT", "False").strip().lower() in ("true", "1", "yes")
 
 if DRY_RUN:
     COMPLETED_RESULTS.add("DRY_RUN")
 
 # Batch settings
-BATCH_SIZE = 300
-BATCH_PAUSE_SECONDS = 1
-
-MAX_WORKERS = 15
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "300"))
+BATCH_PAUSE_SECONDS = int(os.getenv("BATCH_PAUSE_SECONDS", "1"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "15"))
+SAVE_INTERVAL = int(os.getenv("SAVE_INTERVAL", "300"))
 
 TODAY = date.today().strftime("%d %B %Y")
 
@@ -416,8 +436,70 @@ def build_payload(client_id, staff_id):
     }
 
 # =========================================================
-# STEP 6: GENERIC API REQUEST FUNCTION
+# STEP 6: AUTHENTICATION & GENERIC API REQUEST FUNCTION
 # =========================================================
+
+_token_lock = threading.Lock()
+
+
+def fetch_oauth_token():
+    """
+    Authenticate against Finflux OAuth endpoint and return access_token.
+    Equivalent to:
+    curl --location --request POST 'https://hanastaging.finflux.io/fineract-provider/api/oauth/token?username=autoteam&password=AutoTeam%40%232026&client_id=community-app&grant_type=password&client_secret=123' \
+    --header 'Content-Type: application/json' \
+    --header 'Fineract-Platform-TenantID: hanastaging'
+    """
+    params = {
+        "username": FINERACT_USERNAME,
+        "password": FINERACT_PASSWORD,
+        "client_id": FINERACT_CLIENT_ID,
+        "grant_type": FINERACT_GRANT_TYPE,
+        "client_secret": FINERACT_CLIENT_SECRET,
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Fineract-Platform-TenantID": FINERACT_TENANT_ID,
+    }
+
+    response = requests.post(
+        FINERACT_OAUTH_URL,
+        params=params,
+        headers=headers,
+        timeout=30,
+    )
+
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+
+    if not response.ok or not isinstance(data, dict):
+        raise RuntimeError(
+            f"OAuth token request failed [{response.status_code}]: {response.text}"
+        )
+
+    access_token = data.get("access_token")
+    if not access_token:
+        raise ValueError(f"No access_token found in OAuth response: {data}")
+
+    return access_token
+
+
+def get_auth_token(force_refresh=False):
+    """
+    Thread-safe getter for OAuth access token.
+    Fetches a new token if not present or if force_refresh is True.
+    """
+    global TOKEN, HEADERS
+    with _token_lock:
+        if force_refresh or not TOKEN:
+            TOKEN = fetch_oauth_token()
+            HEADERS["Authorization"] = f"Bearer {TOKEN}"
+            HEADERS["fineract-platform-tenantid"] = FINERACT_TENANT_ID
+        return TOKEN
+
+
 def get_http_session():
     if not hasattr(_thread_local, "session"):
         session = requests.Session()
@@ -435,19 +517,22 @@ def get_http_session():
 
     return _thread_local.session
 
-def call_api(method, url, payload=None):
+
+def call_api(method, url, payload=None, retry_auth=True):
     try:
         session = get_http_session()
+
+        if not HEADERS.get("Authorization"):
+            get_auth_token()
+
         response = session.post(
             url, json=payload, headers=HEADERS, timeout=120
         )
-        # response = requests.request(
-        #     method=method,
-        #     url=url,
-        #     headers=HEADERS,
-        #     json=payload,
-        #     timeout=(10, 60),
-        # )
+
+        if response.status_code == 401 and retry_auth:
+            # Token may have expired; refresh once and retry
+            get_auth_token(force_refresh=True)
+            return call_api(method, url, payload=payload, retry_auth=False)
 
         try:
             data = response.json()
@@ -808,11 +893,15 @@ def main():
     except (ValueError, AttributeError):
         pass
 
-    if not TOKEN:
+    try:
+        console.print("[dim]Authenticating with Finflux OAuth...[/dim]")
+        active_token = get_auth_token()
+        console.print(f"[bold green]Successfully authenticated with Finflux (Token: {active_token[:8]}...).[/bold green]")
+    except Exception as exc:
         console.print(
             Panel(
-                "[bold red]Finflux API token is missing.[/bold red]\nPlease configure TOKEN before running.",
-                title="Configuration Error",
+                f"[bold red]Finflux OAuth authentication failed:[/bold red]\n{exc}",
+                title="Authentication Error",
                 border_style="red",
             )
         )
@@ -843,7 +932,8 @@ def main():
         console.print("[bold red]BATCH_SIZE must be at least 1.[/bold red]")
         return
 
-    HEADERS["Authorization"] = f"Bearer {TOKEN}"
+    HEADERS["Authorization"] = f"Bearer {active_token}"
+    HEADERS["fineract-platform-tenantid"] = FINERACT_TENANT_ID
 
     try:
         df = pd.read_excel(INPUT_FILE)
