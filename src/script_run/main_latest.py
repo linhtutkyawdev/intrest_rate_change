@@ -38,6 +38,47 @@ INPUT_FILE = os.getenv("INPUT_FILE", "loan_list.xlsx")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "created_savings_accounts.xlsx")
 CHECKPOINT_FILE = os.getenv("CHECKPOINT_FILE", "savings_accounts_checkpoint.jsonl")
 
+# S3 Output Directory (e.g. s3://uat.hanamicrofinance.net/default/intrest_rate_change/)
+# If empty and INPUT_FILE is an s3:// URL, defaults to the folder of INPUT_FILE
+S3_OUTPUT_DIR = os.getenv("S3_OUTPUT_DIR", "").strip()
+
+# AWS S3 credentials override (if empty, boto3 falls back to ~/.aws or IAM roles)
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "").strip()
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "").strip()
+AWS_SESSION_TOKEN = os.getenv("AWS_SESSION_TOKEN", "").strip()
+AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", os.getenv("AWS_REGION", "")).strip()
+
+
+def is_s3_path(path: str) -> bool:
+    """Check if the given path is an S3 URI."""
+    return bool(path and path.strip().startswith("s3://"))
+
+
+def get_local_checkpoint_path(checkpoint_file=CHECKPOINT_FILE) -> str:
+    """
+    Get the local file path to append checkpoint lines to.
+    If CHECKPOINT_FILE is an S3 URI (s3://bucket/key), returns its basename locally.
+    """
+    cleaned = (checkpoint_file or "").strip()
+    if is_s3_path(cleaned):
+        return os.path.basename(urlparse(cleaned).path)
+    return cleaned or "savings_accounts_checkpoint.jsonl"
+
+
+def get_local_output_path(output_file=OUTPUT_FILE) -> str:
+    """
+    Get the local file path to write Excel output to.
+    If OUTPUT_FILE is an S3 URI (s3://bucket/key), returns its basename locally.
+    """
+    cleaned = (output_file or "").strip()
+    if is_s3_path(cleaned):
+        return os.path.basename(urlparse(cleaned).path)
+    return cleaned or "created_savings_accounts.xlsx"
+
+
+LOCAL_CHECKPOINT_FILE = get_local_checkpoint_path(CHECKPOINT_FILE)
+LOCAL_OUTPUT_FILE = get_local_output_path(OUTPUT_FILE)
+
 # Resume settings
 RESUME_IF_EXISTS = os.getenv("RESUME_IF_EXISTS", "True").strip().lower() in ("true", "1", "yes")
 
@@ -173,9 +214,9 @@ def new_report_row(client_id, csavings14_id=None):
     }
 
 
-def append_to_checkpoint(row, checkpoint_path=CHECKPOINT_FILE):
+def append_to_checkpoint(row, checkpoint_path=LOCAL_CHECKPOINT_FILE):
     """
-    Append a single processed client record as JSON to the checkpoint file.
+    Append a single processed client record as JSON to the local checkpoint file.
     Fast (<0.1ms), thread-safe, and crash-proof for 40k+ volume.
     """
     line = json.dumps(row) + "\n"
@@ -184,13 +225,21 @@ def append_to_checkpoint(row, checkpoint_path=CHECKPOINT_FILE):
             f.write(line)
 
 
-def load_checkpoint(checkpoint_path=CHECKPOINT_FILE):
+def load_checkpoint(checkpoint_path=LOCAL_CHECKPOINT_FILE):
     """
     Load previous progress from the JSONL checkpoint file.
+    If the local checkpoint does not exist or is empty, checks and downloads
+    from S3 (if CHECKPOINT_FILE is an S3 URI or if S3 sync is configured).
     Returns:
         report (dict): {str(client_id): row_dict} (latest state per client)
         completed_client_ids (set): set of client_id ints to skip (COMPLETED / ALREADY_ACTIVATED)
     """
+    # If local checkpoint does not exist or is empty, try downloading from S3
+    if not os.path.exists(checkpoint_path) or os.path.getsize(checkpoint_path) == 0:
+        s3_cp_uri = get_checkpoint_s3_uri()
+        if s3_cp_uri:
+            download_s3_file_if_exists(s3_cp_uri, checkpoint_path)
+
     if not os.path.exists(checkpoint_path):
         return {}, set()
 
@@ -222,11 +271,17 @@ def load_checkpoint(checkpoint_path=CHECKPOINT_FILE):
         return {}, set()
 
 
-def load_from_excel_fallback(output_file=OUTPUT_FILE, checkpoint_path=CHECKPOINT_FILE):
+def load_from_excel_fallback(output_file=LOCAL_OUTPUT_FILE, checkpoint_path=LOCAL_CHECKPOINT_FILE):
     """
     Fallback if checkpoint JSONL does not exist but previous Excel output file exists.
+    Also checks S3 if local Excel does not exist.
     Populates report, identifies completed IDs, and initializes the JSONL checkpoint.
     """
+    if not os.path.exists(output_file) or os.path.getsize(output_file) == 0:
+        s3_out_uri = get_output_s3_uri()
+        if s3_out_uri:
+            download_s3_file_if_exists(s3_out_uri, output_file)
+
     if not os.path.exists(output_file):
         return {}, set()
 
@@ -266,6 +321,145 @@ def is_s3_path(path: str) -> bool:
     return bool(path and path.strip().startswith("s3://"))
 
 
+def get_s3_client():
+    """
+    Get a boto3 S3 client.
+    Uses AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY from .env if provided;
+    otherwise falls back to default credentials (e.g. ~/.aws or IAM roles).
+    """
+    import boto3
+
+    kwargs = {}
+    if AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY:
+        kwargs["aws_access_key_id"] = AWS_ACCESS_KEY_ID
+        kwargs["aws_secret_access_key"] = AWS_SECRET_ACCESS_KEY
+        if AWS_SESSION_TOKEN:
+            kwargs["aws_session_token"] = AWS_SESSION_TOKEN
+    if AWS_DEFAULT_REGION:
+        kwargs["region_name"] = AWS_DEFAULT_REGION
+
+    session = boto3.Session(**kwargs)
+    return session.client("s3")
+
+
+def get_effective_s3_output_dir(input_file=INPUT_FILE, s3_output_dir=S3_OUTPUT_DIR) -> str:
+    """
+    Determine the S3 output directory.
+    If S3_OUTPUT_DIR is explicitly configured, use it.
+    Otherwise, if INPUT_FILE is an S3 URI, default to its parent folder.
+    Returns empty string if S3 output is not configured and INPUT_FILE is local.
+    """
+    target = (s3_output_dir or "").strip()
+    if target:
+        return target if target.endswith("/") else f"{target}/"
+
+    input_cleaned = (input_file or "").strip()
+    if is_s3_path(input_cleaned):
+        parsed = urlparse(input_cleaned)
+        parent_dir = os.path.dirname(parsed.path)
+        if not parent_dir.endswith("/"):
+            parent_dir += "/"
+        return f"s3://{parsed.netloc}{parent_dir}"
+
+    return ""
+
+
+def download_s3_file_if_exists(s3_uri: str, local_path: str) -> bool:
+    """
+    Download a file from S3 to a local file path if it exists.
+    Returns True if downloaded successfully, False otherwise.
+    """
+    if not is_s3_path(s3_uri):
+        return False
+
+    try:
+        parsed = urlparse(s3_uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        if not bucket or not key:
+            return False
+
+        s3 = get_s3_client()
+        s3.download_file(bucket, key, local_path)
+        return True
+    except Exception as exc:
+        return False
+
+
+def get_checkpoint_s3_uri(checkpoint_file=CHECKPOINT_FILE) -> str:
+    """
+    Resolve the S3 URI for the checkpoint file.
+    If CHECKPOINT_FILE is already an s3:// URI, returns it.
+    If S3 output directory is active, returns <s3_dir>/<basename>.
+    Otherwise returns empty string.
+    """
+    cleaned = (checkpoint_file or "").strip()
+    if is_s3_path(cleaned):
+        return cleaned
+
+    s3_dir = get_effective_s3_output_dir()
+    if s3_dir:
+        return f"{s3_dir}{os.path.basename(cleaned)}"
+
+    return ""
+
+
+def get_output_s3_uri(output_file=OUTPUT_FILE) -> str:
+    """
+    Resolve the S3 URI for the output Excel file.
+    If OUTPUT_FILE is already an s3:// URI, returns it.
+    If S3 output directory is active, returns <s3_dir>/<basename>.
+    Otherwise returns empty string.
+    """
+    cleaned = (output_file or "").strip()
+    if is_s3_path(cleaned):
+        return cleaned
+
+    s3_dir = get_effective_s3_output_dir()
+    if s3_dir:
+        return f"{s3_dir}{os.path.basename(cleaned)}"
+
+    return ""
+
+
+def upload_file_to_s3(local_path: str, s3_target_uri: str) -> bool:
+    """
+    Upload a local file to S3. Non-fatal on failure (returns False and prints warning).
+    """
+    if not os.path.exists(local_path):
+        return False
+
+    try:
+        parsed = urlparse(s3_target_uri)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        if not bucket or not key:
+            print(f"Warning: Invalid S3 target URI '{s3_target_uri}'.")
+            return False
+
+        s3 = get_s3_client()
+        s3.upload_file(local_path, bucket, key)
+        return True
+    except Exception as exc:
+        print(f"Warning: Failed to upload '{local_path}' to '{s3_target_uri}': {exc}")
+        return False
+
+
+def sync_outputs_to_s3(output_file=LOCAL_OUTPUT_FILE, checkpoint_file=LOCAL_CHECKPOINT_FILE):
+    """
+    Sync both local output Excel and checkpoint JSONL to the configured S3 directory if active.
+    """
+    s3_dir = get_effective_s3_output_dir()
+    if not s3_dir:
+        return
+
+    output_filename = os.path.basename(output_file)
+    checkpoint_filename = os.path.basename(checkpoint_file)
+
+    upload_file_to_s3(output_file, f"{s3_dir}{output_filename}")
+    upload_file_to_s3(checkpoint_file, f"{s3_dir}{checkpoint_filename}")
+
+
 def read_excel_file(file_path: str, **kwargs) -> pd.DataFrame:
     """
     Read an Excel file from either a local filesystem path or an S3 URI (s3://bucket/key).
@@ -273,15 +467,13 @@ def read_excel_file(file_path: str, **kwargs) -> pd.DataFrame:
     """
     cleaned_path = file_path.strip()
     if is_s3_path(cleaned_path):
-        import boto3
-
         parsed = urlparse(cleaned_path)
         bucket = parsed.netloc
         key = parsed.path.lstrip("/")
         if not bucket or not key:
             raise ValueError(f"Invalid S3 URI '{file_path}'. Expected format: s3://<bucket>/<key>")
 
-        s3_client = boto3.client("s3")
+        s3_client = get_s3_client()
         response = s3_client.get_object(Bucket=bucket, Key=key)
         body = response["Body"].read()
         return pd.read_excel(io.BytesIO(body), **kwargs)
@@ -289,10 +481,11 @@ def read_excel_file(file_path: str, **kwargs) -> pd.DataFrame:
     return pd.read_excel(cleaned_path, **kwargs)
 
 
-def save_report(report, output_file=OUTPUT_FILE):
+def save_report(report, output_file=LOCAL_OUTPUT_FILE, sync_s3=True):
     """
     Atomically write report to Excel using a temporary file and rename.
     Guarantees that OUTPUT_FILE is never corrupted if interrupted mid-write.
+    Optionally syncs output to S3 if configured.
     """
     if not report:
         return
@@ -316,6 +509,9 @@ def save_report(report, output_file=OUTPUT_FILE):
             except OSError:
                 pass
         raise exc
+
+    if sync_s3:
+        sync_outputs_to_s3(output_file=output_file, checkpoint_file=LOCAL_CHECKPOINT_FILE)
 
 # =========================================================
 # STEP 3: DATABASE LOOKUP
@@ -1019,9 +1215,9 @@ def main():
     completed_client_ids = set()
 
     if RESUME_IF_EXISTS:
-        report, completed_client_ids = load_checkpoint(CHECKPOINT_FILE)
-        if not completed_client_ids and os.path.exists(OUTPUT_FILE):
-            report, completed_client_ids = load_from_excel_fallback(OUTPUT_FILE, CHECKPOINT_FILE)
+        report, completed_client_ids = load_checkpoint(LOCAL_CHECKPOINT_FILE)
+        if not completed_client_ids:
+            report, completed_client_ids = load_from_excel_fallback(LOCAL_OUTPUT_FILE, LOCAL_CHECKPOINT_FILE)
 
     # Synchronize input file columns (csavings14_id) into existing report records
     # This ensures that even already-completed clients receive new/upgraded input data upon rerun
@@ -1046,7 +1242,7 @@ def main():
 
     if updated_existing:
         with _checkpoint_lock:
-            with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+            with open(LOCAL_CHECKPOINT_FILE, "w", encoding="utf-8") as f:
                 for r in report.values():
                     f.write(json.dumps(r) + "\n")
         save_report(report)
