@@ -449,6 +449,94 @@ def upload_file_to_s3(local_path: str, s3_target_uri: str) -> bool:
         return False
 
 
+def perform_cli_upload(s3_url: str, file_path: str, console=None) -> bool:
+    """
+    Upload a specified local file to an S3 URI.
+    Supports both:
+      - destination file URI (e.g. s3://bucket/dir/custom_name.xlsx)
+      - destination directory URI (e.g. s3://bucket/dir/ or s3://bucket/dir)
+    """
+    if console is None:
+        console = Console()
+
+    if not os.path.exists(file_path):
+        console.print(
+            Panel(
+                f"[bold red]File not found:[/bold red] '{file_path}'",
+                title="Upload Error",
+                border_style="red",
+            )
+        )
+        return False
+
+    cleaned_s3 = s3_url.strip()
+    if not is_s3_path(cleaned_s3):
+        console.print(
+            Panel(
+                f"[bold red]Invalid S3 URL:[/bold red] '{s3_url}'. Must begin with 's3://'",
+                title="Upload Error",
+                border_style="red",
+            )
+        )
+        return False
+
+    parsed = urlparse(cleaned_s3)
+    bucket = parsed.netloc
+    path = parsed.path.lstrip("/")
+
+    if not bucket:
+        console.print(
+            Panel(
+                f"[bold red]Invalid S3 bucket in URL:[/bold red] '{s3_url}'",
+                title="Upload Error",
+                border_style="red",
+            )
+        )
+        return False
+
+    # If s3_url ends with '/' or has no file extension, treat as directory
+    filename = os.path.basename(file_path)
+    if cleaned_s3.endswith("/") or not os.path.splitext(path)[1]:
+        clean_dir = cleaned_s3.rstrip("/")
+        target_s3_uri = f"{clean_dir}/{filename}"
+        target_key = f"{path.rstrip('/')}/{filename}" if path else filename
+    else:
+        target_s3_uri = cleaned_s3
+        target_key = path
+
+    file_size_bytes = os.path.getsize(file_path)
+    file_size_kb = file_size_bytes / 1024
+
+    console.print(
+        f"[bold cyan]Uploading local file to S3...[/bold cyan]\n"
+        f"  Local file: [yellow]{file_path}[/yellow] ({file_size_kb:,.1f} KB)\n"
+        f"  Destination: [bold green]{target_s3_uri}[/bold green]"
+    )
+
+    try:
+        s3 = get_s3_client()
+        s3.upload_file(file_path, bucket, target_key)
+        console.print(
+            Panel(
+                f"[bold green]File uploaded successfully![/bold green]\n"
+                f"Source: {file_path}\n"
+                f"Target: [bold cyan]{target_s3_uri}[/bold cyan]",
+                title="Upload Complete",
+                border_style="green",
+            )
+        )
+        return True
+    except Exception as exc:
+        console.print(
+            Panel(
+                f"[bold red]Failed to upload file to S3:[/bold red]\n{exc}",
+                title="Upload Failed",
+                border_style="red",
+            )
+        )
+        return False
+
+
 def sync_outputs_to_s3(output_file=LOCAL_OUTPUT_FILE, checkpoint_file=LOCAL_CHECKPOINT_FILE):
     """
     Sync both local output Excel and checkpoint JSONL to the configured S3 directory if active.
@@ -1271,7 +1359,20 @@ def main():
         action="store_true",
         help="Move input, output, and checkpoint files to an incremental backup_n folder (in S3 when input is S3, or locally) and exit.",
     )
+    parser.add_argument(
+        "--upload",
+        nargs=2,
+        metavar=("<s3_url>", "<file_path>"),
+        help="Upload a local file to S3 (uses credentials from .env or IAM/credentials) and exit.",
+    )
     args = parser.parse_args()
+
+    if args.upload:
+        s3_target, local_file = args.upload
+        success = perform_cli_upload(s3_target, local_file, console=console)
+        if not success:
+            sys.exit(1)
+        return
 
     if args.backup:
         perform_backup(console=console)
