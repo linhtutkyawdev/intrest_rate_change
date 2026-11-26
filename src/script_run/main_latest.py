@@ -1,7 +1,11 @@
+import argparse
 import io
 import json
 import os
+import re
+import shutil
 import signal
+import sys
 import tempfile
 import time
 from datetime import date
@@ -512,6 +516,163 @@ def save_report(report, output_file=LOCAL_OUTPUT_FILE, sync_s3=True):
 
     if sync_s3:
         sync_outputs_to_s3(output_file=output_file, checkpoint_file=LOCAL_CHECKPOINT_FILE)
+
+
+# =========================================================
+# STEP 2.5: BACKUP LOGIC (--backup)
+# =========================================================
+
+def get_next_backup_number_local(base_dir=".") -> int:
+    """Find the highest integer n among existing 'backup_n' directories and return n + 1."""
+    max_n = 0
+    if os.path.exists(base_dir):
+        for entry in os.listdir(base_dir):
+            if os.path.isdir(os.path.join(base_dir, entry)):
+                m = re.match(r"^backup_(\d+)$", entry)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+    return max_n + 1
+
+
+def get_next_backup_number_s3(s3_dir_uri: str) -> int:
+    """Find the highest integer n among existing 'backup_n/' prefixes under s3_dir_uri and return n + 1."""
+    parsed = urlparse(s3_dir_uri)
+    bucket = parsed.netloc
+    prefix = parsed.path.lstrip("/")
+    if prefix and not prefix.endswith("/"):
+        prefix += "/"
+
+    s3 = get_s3_client()
+    paginator = s3.get_paginator("list_objects_v2")
+    max_n = 0
+    try:
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/"):
+            for cp in page.get("CommonPrefixes", []):
+                sub_folder = cp["Prefix"][len(prefix):].rstrip("/")
+                m = re.match(r"^backup_(\d+)$", sub_folder)
+                if m:
+                    max_n = max(max_n, int(m.group(1)))
+    except Exception as exc:
+        print(f"Warning: Failed to scan S3 backup prefixes: {exc}")
+    return max_n + 1
+
+
+def perform_backup(console=None):
+    """
+    Move INPUT_FILE, OUTPUT_FILE, and CHECKPOINT_FILE to an incremental backup_n folder.
+    - If INPUT_FILE is an S3 URI, moves the files in S3 under <s3_parent_dir>/backup_<n>/.
+      Also moves any local output/checkpoint files if present.
+    - If INPUT_FILE is local, moves local files into ./backup_<n>/.
+    """
+    if console is None:
+        console = Console()
+
+    is_s3_input = is_s3_path(INPUT_FILE)
+
+    if is_s3_input:
+        s3_dir = get_effective_s3_output_dir()
+        if not s3_dir:
+            parsed = urlparse(INPUT_FILE)
+            parent_dir = os.path.dirname(parsed.path)
+            if not parent_dir.endswith("/"):
+                parent_dir += "/"
+            s3_dir = f"s3://{parsed.netloc}{parent_dir}"
+
+        next_n = get_next_backup_number_s3(s3_dir)
+        backup_folder_name = f"backup_{next_n}"
+        backup_s3_prefix = f"{s3_dir}{backup_folder_name}/"
+
+        console.print(f"[bold cyan]Backing up S3 files to [bold yellow]{backup_s3_prefix}[/bold yellow]...[/bold cyan]")
+
+        s3 = get_s3_client()
+        s3_files = [
+            INPUT_FILE,
+            get_output_s3_uri(),
+            get_checkpoint_s3_uri(),
+        ]
+        # Deduplicate while preserving order
+        unique_s3_files = list(dict.fromkeys(filter(bool, s3_files)))
+
+        moved_s3_count = 0
+        for s3_uri in unique_s3_files:
+            try:
+                p = urlparse(s3_uri)
+                bucket = p.netloc
+                src_key = p.path.lstrip("/")
+                filename = os.path.basename(src_key)
+
+                # Check if object exists
+                s3.head_object(Bucket=bucket, Key=src_key)
+
+                # Copy to backup location
+                dst_prefix = urlparse(backup_s3_prefix).path.lstrip("/")
+                dst_key = f"{dst_prefix}{filename}"
+                s3.copy_object(
+                    Bucket=bucket,
+                    Key=dst_key,
+                    CopySource={"Bucket": bucket, "Key": src_key},
+                )
+                s3.delete_object(Bucket=bucket, Key=src_key)
+                console.print(f"  [green]✓ Moved in S3:[/green] {filename} -> {backup_folder_name}/{filename}")
+                moved_s3_count += 1
+            except Exception:
+                pass
+
+        # Also backup local files if they exist locally
+        local_files = [
+            LOCAL_CHECKPOINT_FILE,
+            LOCAL_OUTPUT_FILE,
+            INPUT_FILE if not is_s3_input else os.path.basename(urlparse(INPUT_FILE).path),
+        ]
+        local_moved_count = 0
+        local_backup_dir = f"backup_{next_n}"
+        for lf in set(local_files):
+            if os.path.exists(lf):
+                os.makedirs(local_backup_dir, exist_ok=True)
+                dest = os.path.join(local_backup_dir, os.path.basename(lf))
+                shutil.move(lf, dest)
+                console.print(f"  [dim green]✓ Moved local file:[/dim green] {lf} -> {dest}")
+                local_moved_count += 1
+
+        if moved_s3_count == 0 and local_moved_count == 0:
+            console.print("[yellow]No existing files were found to backup.[/yellow]")
+        else:
+            msg = (
+                f"[bold green]Backup complete![/bold green]\n"
+                f"S3 backup location: [bold cyan]{backup_s3_prefix}[/bold cyan] ({moved_s3_count} files)\n"
+            )
+            if local_moved_count:
+                msg += f"Local backup folder: [bold cyan]{local_backup_dir}[/bold cyan] ({local_moved_count} files)"
+            console.print(Panel(msg.strip(), title="Backup Successful", border_style="green"))
+
+    else:
+        # Local filesystem backup
+        next_n = get_next_backup_number_local(".")
+        backup_folder_name = f"backup_{next_n}"
+        os.makedirs(backup_folder_name, exist_ok=True)
+
+        console.print(f"[bold cyan]Backing up local files to [bold yellow]{backup_folder_name}/[/bold yellow]...[/bold cyan]")
+
+        local_files = [INPUT_FILE, OUTPUT_FILE, CHECKPOINT_FILE]
+        moved_count = 0
+        for lf in set(local_files):
+            if os.path.exists(lf):
+                dest = os.path.join(backup_folder_name, os.path.basename(lf))
+                shutil.move(lf, dest)
+                console.print(f"  [green]✓ Moved:[/green] {lf} -> {dest}")
+                moved_count += 1
+
+        if moved_count == 0:
+            console.print("[yellow]No existing files were found to backup.[/yellow]")
+        else:
+            console.print(
+                Panel(
+                    f"[bold green]Backup complete![/bold green]\n"
+                    f"Files moved to: [bold cyan]{backup_folder_name}/[/bold cyan] ({moved_count} files)",
+                    title="Backup Successful",
+                    border_style="green",
+                )
+            )
 
 # =========================================================
 # STEP 3: DATABASE LOOKUP
@@ -1101,6 +1262,20 @@ def process_client(pool, client_id, csavings14_id, existing_row):
 
 def main():
     console = Console()
+
+    parser = argparse.ArgumentParser(
+        description="Finflux Savings Account Interest Rate Automation & Migration",
+    )
+    parser.add_argument(
+        "--backup",
+        action="store_true",
+        help="Move input, output, and checkpoint files to an incremental backup_n folder (in S3 when input is S3, or locally) and exit.",
+    )
+    args = parser.parse_args()
+
+    if args.backup:
+        perform_backup(console=console)
+        return
 
     # Graceful signal handling (Ctrl+C, SIGTERM)
     shutdown_requested = threading.Event()
