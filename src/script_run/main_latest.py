@@ -1,9 +1,11 @@
+import io
 import json
 import os
 import signal
 import tempfile
 import time
 from datetime import date
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 import mysql.connector
@@ -257,6 +259,34 @@ def load_from_excel_fallback(output_file=OUTPUT_FILE, checkpoint_path=CHECKPOINT
     except Exception as exc:
         print(f"Warning: Failed to load previous Excel file '{output_file}': {exc}")
         return {}, set()
+
+
+def is_s3_path(path: str) -> bool:
+    """Check if the given path is an S3 URI."""
+    return bool(path and path.strip().startswith("s3://"))
+
+
+def read_excel_file(file_path: str, **kwargs) -> pd.DataFrame:
+    """
+    Read an Excel file from either a local filesystem path or an S3 URI (s3://bucket/key).
+    Uses boto3 to fetch object bytes into memory if an S3 URI is provided.
+    """
+    cleaned_path = file_path.strip()
+    if is_s3_path(cleaned_path):
+        import boto3
+
+        parsed = urlparse(cleaned_path)
+        bucket = parsed.netloc
+        key = parsed.path.lstrip("/")
+        if not bucket or not key:
+            raise ValueError(f"Invalid S3 URI '{file_path}'. Expected format: s3://<bucket>/<key>")
+
+        s3_client = boto3.client("s3")
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        body = response["Body"].read()
+        return pd.read_excel(io.BytesIO(body), **kwargs)
+
+    return pd.read_excel(cleaned_path, **kwargs)
 
 
 def save_report(report, output_file=OUTPUT_FILE):
@@ -931,7 +961,9 @@ def main():
     HEADERS["fineract-platform-tenantid"] = FINERACT_TENANT_ID
 
     try:
-        df = pd.read_excel(INPUT_FILE)
+        if is_s3_path(INPUT_FILE):
+            console.print(f"[dim]Fetching input Excel file from S3: {INPUT_FILE}...[/dim]")
+        df = read_excel_file(INPUT_FILE)
     except Exception as exc:
         console.print(
             Panel(

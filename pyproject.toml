@@ -8,6 +8,7 @@ authors = [
 ]
 requires-python = ">=3.13"
 dependencies = [
+    "boto3>=1.44.12",
     "mysql-connector-python>=26.10.0",
     "openpyxl>=3.1.5",
     "pandas>=3.1.1",
