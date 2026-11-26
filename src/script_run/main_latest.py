@@ -14,7 +14,7 @@ from requests.adapters import HTTPAdapter
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
-load_dotenv()
+load_dotenv(override=True)
 
 _thread_local = threading.local()
 
